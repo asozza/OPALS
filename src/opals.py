@@ -5,7 +5,7 @@
 Opals module
 
 Author: Alessandro Sozza (CNR-ISAC)
-Date: March 2024
+Date: March 2025
 """
 
 import os
