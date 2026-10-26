@@ -11,7 +11,11 @@ land-only subdomains, without having to run nemo.exe.
 
 Usage:
     python opals.py domain_cfg.nc -n 256
-    python opals.py domain_cfg.nc -n 256 --best     # only the best partition for 256 cores
+    python opals.py domain_cfg.nc -n 256 --cores-per-node 128   # add the best choice per number of nodes
+    python opals.py domain_cfg.nc -n 256 --best                 # only the best partition for 256 cores
+    python opals.py domain_cfg.nc --jpni 20 --jpnj 15           # check a given decomposition
+    python opals.py domain_cfg.nc -n 256 --best --plot map.png  # map of the decomposition
+    python opals.py domain_cfg.nc --save-mask orca2.npz         # small land-sea mask, usable instead of domain_cfg.nc
 
 Author: Alessandro Sozza (CNR-ISAC)
 Date: March 2025
@@ -27,7 +31,7 @@ def read_bathymetry(domcfg, bdyfile=None):
     Read the land-sea mask from the domain configuration file (readbot_strip)
 
     Args:
-    - domcfg: path to domain_cfg.nc
+    - domcfg: path to domain_cfg.nc, or to a mask written by save_mask (.npz)
     - bdyfile: optional path to a file containing bdy_msk
 
     Returns:
@@ -35,6 +39,13 @@ def read_bathymetry(domcfg, bdyfile=None):
     - jperio: lateral boundary condition type
     - cfg: configuration name (if available)
     """
+
+    if str(domcfg).endswith('.npz'):
+        with np.load(domcfg) as npz:
+            shape = tuple(npz['shape'])
+            lloce = np.unpackbits(npz['mask'])[:shape[0]*shape[1]].reshape(shape).astype(bool)
+            cfg = str(npz['cfg']) or None
+            return lloce, int(npz['jperio']), cfg
 
     ds = xr.open_dataset(domcfg)
     zbot = ds['bottom_level'].squeeze().values.astype(float)
@@ -46,6 +57,13 @@ def read_bathymetry(domcfg, bdyfile=None):
     ds.close()
 
     return zbot > 0., jperio, cfg
+
+
+def save_mask(filename, lloce, jperio, cfg=None):
+    """ Save the land-sea mask as a small bit-packed .npz file (a few kB instead of the full domain_cfg.nc) """
+
+    np.savez_compressed(filename, mask=np.packbits(lloce), shape=np.array(lloce.shape),
+                        jperio=jperio, cfg=cfg or '')
 
 
 def nint(x):
@@ -261,6 +279,113 @@ def bestpartition(lloce, jperio, knbij, nn_hls=1, ldlist=False):
     return None
 
 
+def decomposition_info(lloce, jperio, jpni, jpnj, nn_hls=1):
+    """
+    Describe a given jpni x jpnj decomposition
+
+    Returns a dict with the number of ocean/land subdomains, the largest subdomain
+    size (jpimax, jpjmax, including halos) and the ocean mask of the subdomains (jpnj, jpni)
+    """
+
+    Nj0glo, Ni0glo = lloce.shape
+    isoce = mpp_is_ocean(lloce, jperio, jpni, jpnj)
+    jpimax, jpjmax, *_ = mpp_basesplit(Ni0glo + 2*nn_hls, Nj0glo + 2*nn_hls, nn_hls, jpni, jpnj, jperio)
+    inbij = int(np.count_nonzero(isoce))
+
+    return dict(jpni=jpni, jpnj=jpnj, nb_cores=inbij, land=jpni*jpnj - inbij,
+                percentage=(jpni*jpnj - inbij) / (jpni*jpnj) * 100.,
+                jpimax=jpimax, jpjmax=jpjmax, isoce=isoce)
+
+
+def best_per_node(res, ncpn):
+    """
+    For each number of nodes, pick the best partition of the list that fits in it
+
+    The list is sorted by decreasing number of cores (i.e. increasing subdomain size),
+    so the best partition on k nodes is the first one with nb_cores <= k*ncpn.
+    Node counts that would not improve on k-1 nodes are skipped.
+
+    Args:
+    - res: list of best partitions from bestpartition(..., ldlist=True)
+    - ncpn: number of cores per node
+
+    Returns:
+    - list of dicts (nodes, idle, fill + the partition keys)
+    """
+
+    out = []
+    knodes = -(-res[0]['nb_cores'] // ncpn)
+    for k in range(1, knodes + 1):
+        r = next((r for r in res if r['nb_cores'] <= k*ncpn), None)
+        if r is not None and r['nb_cores'] > (k-1)*ncpn:
+            out.append(dict(r, nodes=k, idle=k*ncpn - r['nb_cores'], fill=r['nb_cores'] / (k*ncpn) * 100.))
+
+    return out
+
+
+def print_namelist(r):
+    """ Print the &nammpp block and the number of MPI tasks for a given partition """
+
+    print('!-----------------------------------------------------------------------')
+    print('&nammpp        !   Massively Parallel Processing')
+    print('!-----------------------------------------------------------------------')
+    print(f"   jpni        = {r['jpni']:4d}   !  number of processors following i")
+    print(f"   jpnj        = {r['jpnj']:4d}   !  number of processors following j")
+    print('/')
+    print(f"   ==> run nemo.exe on {r['nb_cores']} MPI tasks ({r['land']} land subdomains suppressed)")
+
+
+def plot_decomposition(filename, lloce, jperio, jpni, jpnj, cfg=None):
+    """
+    Plot the land-sea mask with the jpni x jpnj subdomains on top:
+    suppressed land subdomains are shaded, ocean subdomains are labelled with their MPI rank
+
+    The subdomain boundaries are the ones used for land suppression (inner domain, no halos).
+    """
+
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
+    from matplotlib.patches import Rectangle
+
+    Nj0glo, Ni0glo = lloce.shape
+    _, _, iimppt, ijmppt, ijpi, ijpj = mpp_basesplit(Ni0glo, Nj0glo, 0, jpni, jpnj, jperio)
+    isoce = mpp_is_ocean(lloce, jperio, jpni, jpnj)
+
+    fig, ax = plt.subplots(figsize=(12, 12 * Nj0glo / Ni0glo + 0.8))
+    ax.imshow(lloce, origin='lower', cmap=ListedColormap(['#e6dcc3', '#9ecae1']), vmin=0, vmax=1,
+              extent=(0, Ni0glo, 0, Nj0glo), interpolation='nearest')
+
+    labels = jpni*jpnj <= 600
+    irank = 0
+    for jj in range(jpnj):                                   # same numbering as mpp_getnum
+        for ji in range(jpni):
+            x0, y0 = iimppt[ji] - 1, ijmppt[jj] - 1
+            if isoce[jj, ji]:
+                ax.add_patch(Rectangle((x0, y0), ijpi[ji], ijpj[jj], fill=False, lw=0.6, ec='k'))
+                if labels:
+                    ax.text(x0 + ijpi[ji]/2, y0 + ijpj[jj]/2, str(irank), ha='center', va='center',
+                            fontsize=max(4, min(9, 400 / max(jpni, jpnj) / 4)))
+                irank += 1
+            else:
+                ax.add_patch(Rectangle((x0, y0), ijpi[ji], ijpj[jj], fc='0.45', ec='k', lw=0.6,
+                                       alpha=0.75, hatch='//'))
+
+    inbij = int(np.count_nonzero(isoce))
+    title = f'{cfg}: ' if cfg else ''
+    title += (f'{jpni} x {jpnj} = {jpni*jpnj} subdomains, {inbij} ocean MPI tasks, '
+              f'{jpni*jpnj - inbij} land subdomains suppressed ({(jpni*jpnj - inbij) / (jpni*jpnj) * 100:.1f}%)')
+    ax.set_title(title)
+    ax.set_xlabel('i')
+    ax.set_ylabel('j')
+    ax.set_xlim(0, Ni0glo)
+    ax.set_ylim(0, Nj0glo)
+    fig.tight_layout()
+    fig.savefig(filename, dpi=150)
+    plt.close(fig)
+
+
 def print_list(res):
     """ Print the list of best partitions with the same format as NEMO ocean.output """
 
@@ -278,37 +403,98 @@ def print_list(res):
 def main():
 
     parser = argparse.ArgumentParser(description='NEMO best domain decomposition (ln_listonly) in python')
-    parser.add_argument('domcfg', help='domain configuration file (domain_cfg.nc)')
-    parser.add_argument('-n', '--ncores', type=int, required=True,
+    parser.add_argument('domcfg', help='domain configuration file (domain_cfg.nc) or mask saved with --save-mask')
+    parser.add_argument('-n', '--ncores', type=int, default=None,
                         help='number of MPI processes, i.e. max(mppsize, jpni*jpnj)')
     parser.add_argument('--hls', type=int, default=1, help='halo width nn_hls (default: 1)')
     parser.add_argument('--bdy', default=None, help='optional file containing bdy_msk')
     parser.add_argument('--best', action='store_true',
                         help='print only the best decomposition for ncores instead of the list')
+    parser.add_argument('--jpni', type=int, default=None, help='check this decomposition along i (with --jpnj)')
+    parser.add_argument('--jpnj', type=int, default=None, help='check this decomposition along j (with --jpni)')
+    parser.add_argument('--cores-per-node', type=int, default=None,
+                        help='also print the best partition for each number of nodes')
+    parser.add_argument('--plot', default=None, metavar='FILE',
+                        help='plot the decomposition (--jpni/--jpnj, otherwise the best one for ncores)')
+    parser.add_argument('--save-mask', default=None, metavar='FILE.npz',
+                        help='save the land-sea mask in a small .npz file and exit')
     parser.add_argument('-v', '--verbose', action='store_true', help='also print jpni x jpnj in the list')
     args = parser.parse_args()
 
+    lcheck = args.jpni is not None or args.jpnj is not None
+    if lcheck and (args.jpni is None or args.jpnj is None):
+        parser.error('--jpni and --jpnj must be given together')
+    if args.ncores is None and not lcheck and not args.save_mask:
+        parser.error('-n/--ncores is required (unless --jpni/--jpnj or --save-mask are given)')
+
     lloce, jperio, cfg = read_bathymetry(args.domcfg, args.bdy)
     nn_hls = max(1, args.hls)
+
+    if args.save_mask:
+        save_mask(args.save_mask, lloce, jperio, cfg)
+        print(f'   land-sea mask saved in {args.save_mask}')
+        return
+
     Nj0glo, Ni0glo = lloce.shape
-    print(f'       Configuration = {cfg}' if cfg else '')
+    if cfg:
+        print(f'       Configuration = {cfg}')
     print(f'       Ni0glo = {Ni0glo:12d}')
     print(f'       Nj0glo = {Nj0glo:12d}')
     print(f'       jperio = {jperio:12d}')
     print(' ')
 
-    if args.best:
-        ni, nj, icnt = bestpartition(lloce, jperio, args.ncores, nn_hls)
-        print(f'   The best domain decomposition {ni} x {nj} with {icnt} land subdomains')
-        print(f'      - uses a total of {ni*nj - icnt} mpi process')
-        return
-
-    res = bestpartition(lloce, jperio, args.ncores, nn_hls, ldlist=True)
-    print_list(res)
-    if args.verbose:
+    if lcheck:
+        # same diagnostics as mpp_init when jpni and jpnj are given in the namelist
+        r = decomposition_info(lloce, jperio, args.jpni, args.jpnj, nn_hls)
+        print(f"   The chosen domain decomposition {r['jpni']} x {r['jpnj']} with {r['land']} land subdomains")
+        print(f"      - uses a total of {r['nb_cores']} mpi process")
+        print(f"      - has mpi subdomains with a maximum size of (jpi = {r['jpimax']}, jpj = {r['jpjmax']}, "
+              f"jpi*jpj = {r['jpimax']*r['jpjmax']})")
+        ni, nj, _ = bestpartition(lloce, jperio, args.ncores or r['nb_cores'], nn_hls)
+        b = decomposition_info(lloce, jperio, ni, nj, nn_hls)
+        print(f"   The best domain decomposition {b['jpni']} x {b['jpnj']} with {b['land']} land subdomains")
+        print(f"      - uses a total of {b['nb_cores']} mpi process")
+        print(f"      - has mpi subdomains with a maximum size of (jpi = {b['jpimax']}, jpj = {b['jpjmax']}, "
+              f"jpi*jpj = {b['jpimax']*b['jpjmax']})")
+        if b['jpimax']*b['jpjmax'] < r['jpimax']*r['jpjmax'] or \
+           (b['jpimax']*b['jpjmax'] == r['jpimax']*r['jpjmax'] and b['nb_cores'] < r['nb_cores']):
+            print('    ---   YOU ARE WASTING CPU...   ---')
+        else:
+            print('   ==> you use the best mpi decomposition')
         print(' ')
-        for r in res:
-            print(f"nb_cores oce: {r['nb_cores']:6d}  ->  jpni = {r['jpni']:4d}, jpnj = {r['jpnj']:4d}")
+        print_namelist(r)
+    elif args.best:
+        ni, nj, _ = bestpartition(lloce, jperio, args.ncores, nn_hls)
+        r = decomposition_info(lloce, jperio, ni, nj, nn_hls)
+        print(f"   The best domain decomposition {ni} x {nj} with {r['land']} land subdomains")
+        print(f"      - uses a total of {r['nb_cores']} mpi process")
+        print(' ')
+        print_namelist(r)
+    else:
+        res = bestpartition(lloce, jperio, args.ncores, nn_hls, ldlist=True)
+        print_list(res)
+        if args.verbose:
+            print(' ')
+            for r in res:
+                print(f"nb_cores oce: {r['nb_cores']:6d}  ->  jpni = {r['jpni']:4d}, jpnj = {r['jpnj']:4d}")
+        if args.cores_per_node:
+            print(' ')
+            print(f"   best partition for each number of nodes ({args.cores_per_node} cores per node)")
+            print('   -----------------------------------------------------------')
+            for r in best_per_node(res, args.cores_per_node):
+                print(f"   nodes: {r['nodes']:4d}, nb_cores oce: {r['nb_cores']:6d}, idle cores: {r['idle']:4d} "
+                      f"(fill {r['fill']:5.1f}%), jpni x jpnj = {r['jpni']:4d} x {r['jpnj']:4d}, "
+                      f"largest oce domain: {r['iszi']:4d} x {r['iszj']:4d}")
+        ni = nj = None
+        if args.plot:
+            ni, nj, _ = bestpartition(lloce, jperio, args.ncores, nn_hls)
+
+    if args.plot:
+        if lcheck:
+            ni, nj = args.jpni, args.jpnj
+        plot_decomposition(args.plot, lloce, jperio, ni, nj, cfg)
+        print(' ')
+        print(f'   decomposition {ni} x {nj} plotted in {args.plot}')
 
 
 if __name__ == '__main__':
