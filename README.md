@@ -11,7 +11,7 @@ Requirements: `numpy`, `xarray` (with a netCDF backend), `matplotlib` (only for 
 
 ![ORCA2 decomposition](orca2_map.png)
 
-*Best decomposition of ORCA2 for 256 cores (`python opals.py orca2_mask.npz -n 256 --best --plot orca2_map.png`):
+*Best decomposition of ORCA2 for 256 cores (`python opals.py data/orca2_mask.npz -n 256 --best --plot orca2_map.png`):
 20 x 15 subdomains, 46 land-only subdomains suppressed (hatched), 254 MPI tasks labelled with their rank.*
 
 ## Usage
@@ -25,7 +25,7 @@ python opals.py domain_cfg.nc -n 256 --balance                # load-balance dia
 python opals.py domain_cfg.nc -n 256 --best                   # best decomposition for 256 cores + &nammpp block
 python opals.py domain_cfg.nc --jpni 16 --jpnj 16 -n 256      # check a given decomposition (wasting CPU?)
 python opals.py domain_cfg.nc -n 256 --best --plot map.png    # map of the subdomains, land ones shaded
-python opals.py domain_cfg.nc --save-mask orca2_mask.npz      # save the land-sea mask in a few kB
+python opals.py domain_cfg.nc --save-mask data/mymask.npz    # save the land-sea mask in a few kB
 ```
 
 `-n` plays the role of `max(mppsize, jpni*jpnj)`: the list explores up to about
@@ -53,5 +53,5 @@ A `.npz` mask written by `--save-mask` (land-sea mask + number of wet levels) ca
 python -m unittest -v test_opals
 ```
 
-`orca2_mask.npz` and `eorca1_mask.npz` are the land-sea masks of ORCA2 and eORCA1,
-`orca2_ref.txt` is the list printed by `nemo.exe` for ORCA2 with 256 cores, reproduced exactly.
+`data/orca2_mask.npz` and `data/eorca1_mask.npz` are the land-sea masks of ORCA2 and eORCA1,
+`data/orca2_ref.txt` is the list printed by `nemo.exe` for ORCA2 with 256 cores, reproduced exactly.

@@ -8,9 +8,9 @@ Run with:
     python -m unittest -v test_opals
     python -m pytest test_opals.py
 
-The land-sea masks are stored as small .npz files (see opals.py --save-mask),
+The land-sea masks are stored as small .npz files in data/ (see opals.py --save-mask),
 since domain_cfg.nc files are too large for the repository.
-orca2_ref.txt is the list printed by nemo.exe with ln_listonly = .true. (ORCA2, 256 cores).
+data/orca2_ref.txt is the list printed by nemo.exe with ln_listonly = .true. (ORCA2, 256 cores).
 """
 
 import io
@@ -24,10 +24,11 @@ import numpy as np
 import opals
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(HERE, 'data')
 
 
 def load(name):
-    return opals.read_bathymetry(os.path.join(HERE, name))
+    return opals.read_bathymetry(os.path.join(DATA, name))
 
 
 class TestBasesplit(unittest.TestCase):
@@ -59,7 +60,7 @@ class TestORCA2(unittest.TestCase):
         with contextlib.redirect_stdout(buf):
             opals.print_list(res)
         got = [l.rstrip() for l in buf.getvalue().splitlines() if l.startswith('nb_cores')]
-        with open(os.path.join(HERE, 'orca2_ref.txt')) as f:
+        with open(os.path.join(DATA, 'orca2_ref.txt')) as f:
             ref = [l.rstrip() for l in f]
         self.assertEqual(got, ref)
 
@@ -92,7 +93,7 @@ class TestORCA2(unittest.TestCase):
             self.assertEqual(r['idle'], r['nodes']*128 - r['nb_cores'] - 40)
 
     def test_load_balance(self):
-        levels = opals.read_levels(os.path.join(HERE, 'orca2_mask.npz'))
+        levels = opals.read_levels(os.path.join(DATA, 'orca2_mask.npz'))
         self.assertEqual(levels.shape, self.lloce.shape)
         self.assertTrue(((levels > 0) == self.lloce).all())
         # one subdomain: all the wet points, no imbalance
