@@ -9,6 +9,11 @@ suppression, reading only `domain_cfg.nc` (no need to run `nemo.exe`).
 
 Requirements: `numpy`, `xarray` (with a netCDF backend), `matplotlib` (only for `--plot`).
 
+![ORCA2 decomposition](orca2_map.png)
+
+*Best decomposition of ORCA2 for 256 cores (`python opals.py orca2_mask.npz -n 256 --best --plot orca2_map.png`):
+20 x 15 subdomains, 46 land-only subdomains suppressed (hatched), 254 MPI tasks labelled with their rank.*
+
 ## Usage
 
 ```
