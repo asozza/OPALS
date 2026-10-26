@@ -83,6 +83,32 @@ class TestORCA2(unittest.TestCase):
         for r in out:
             self.assertTrue((r['nodes']-1)*128 < r['nb_cores'] <= r['nodes']*128)
 
+    def test_best_per_node_extra_cores(self):
+        res = opals.bestpartition(self.lloce, self.jperio, 256, ldlist=True)
+        out = opals.best_per_node(res, 128, nextra=40)
+        self.assertEqual(out[0]['nb_cores'], 88)                  # 88 + 40 = 128: one full node
+        for r in out:
+            self.assertTrue((r['nodes']-1)*128 < r['nb_cores'] + 40 <= r['nodes']*128)
+            self.assertEqual(r['idle'], r['nodes']*128 - r['nb_cores'] - 40)
+
+    def test_load_balance(self):
+        levels = opals.read_levels(os.path.join(HERE, 'orca2_mask.npz'))
+        self.assertEqual(levels.shape, self.lloce.shape)
+        self.assertTrue(((levels > 0) == self.lloce).all())
+        # one subdomain: all the wet points, no imbalance
+        b2 = opals.load_balance(self.lloce, self.jperio, 1, 1)
+        self.assertEqual(b2['wmax'], np.count_nonzero(self.lloce))
+        self.assertAlmostEqual(b2['imbalance'], 1.0)
+        b3 = opals.load_balance(self.lloce, self.jperio, 1, 1, levels=levels)
+        self.assertEqual(b3['wmax'], levels.sum())
+        # the inner domains of the ocean subdomains contain all the wet points
+        for ni, nj in [(20, 15), (16, 16), (7, 3)]:
+            b = opals.load_balance(self.lloce, self.jperio, ni, nj, levels=levels)
+            nb = np.count_nonzero(opals.mpp_is_ocean(self.lloce, self.jperio, ni, nj))
+            self.assertAlmostEqual(b['wmean'] * nb, levels.sum())
+            self.assertGreaterEqual(b['imbalance'], 1.0)
+            self.assertTrue(0. < b['wet_frac'] <= 100.)
+
     def test_plot(self):
         try:
             import matplotlib  # noqa: F401

@@ -59,11 +59,37 @@ def read_bathymetry(domcfg, bdyfile=None):
     return zbot > 0., jperio, cfg
 
 
-def save_mask(filename, lloce, jperio, cfg=None):
-    """ Save the land-sea mask as a small bit-packed .npz file (a few kB instead of the full domain_cfg.nc) """
+def read_levels(domcfg):
+    """
+    Read the number of wet levels of each water column (bottom_level - top_level + 1)
 
+    Args:
+    - domcfg: path to domain_cfg.nc, or to a mask written by save_mask (.npz)
+
+    Returns:
+    - integer array (Nj0glo, Ni0glo), 0 on land, or None if not available
+    """
+
+    if str(domcfg).endswith('.npz'):
+        with np.load(domcfg) as npz:
+            return npz['levels'].astype(int) if 'levels' in npz else None
+
+    with xr.open_dataset(domcfg) as ds:
+        kbot = ds['bottom_level'].squeeze().values.astype(int)
+        ktop = ds['top_level'].squeeze().values.astype(int) if 'top_level' in ds else np.ones_like(kbot)
+
+    return np.where(kbot > 0, kbot - np.maximum(ktop, 1) + 1, 0)
+
+
+def save_mask(filename, lloce, jperio, cfg=None, levels=None):
+    """
+    Save the land-sea mask as a small bit-packed .npz file (a few kB instead of the full domain_cfg.nc),
+    optionally with the number of wet levels used by the load-balance diagnostics
+    """
+
+    extra = {} if levels is None else dict(levels=levels.astype(np.uint16))
     np.savez_compressed(filename, mask=np.packbits(lloce), shape=np.array(lloce.shape),
-                        jperio=jperio, cfg=cfg or '')
+                        jperio=jperio, cfg=cfg or '', **extra)
 
 
 def nint(x):
@@ -297,28 +323,73 @@ def decomposition_info(lloce, jperio, jpni, jpnj, nn_hls=1):
                 jpimax=jpimax, jpjmax=jpjmax, isoce=isoce)
 
 
-def best_per_node(res, ncpn):
+def load_balance(lloce, jperio, jpni, jpnj, nn_hls=1, levels=None):
+    """
+    Load-balance diagnostics of a jpni x jpnj decomposition, based on the wet points
+    in the inner domain (no halos) of each ocean subdomain
+
+    NEMO computes on every point of a subdomain (land points are masked), so its cost
+    scales with jpimax*jpjmax*jpk: the wet fraction measures how much of this work is
+    done on ocean points. The imbalance (max / mean wet points per subdomain) matters for
+    the parts whose cost scales with the wet points (e.g. sea ice, I/O, some diagnostics).
+
+    Args:
+    - lloce: boolean land-sea mask (Nj0glo, Ni0glo)
+    - jperio: lateral boundary condition type
+    - jpni, jpnj: number of subdomains along i and j
+    - nn_hls: halo width
+    - levels: optional number of wet levels per column (Nj0glo, Ni0glo): 3D wet points instead of 2D
+
+    Returns:
+    - dict with wet points per ocean subdomain (wmin, wmax, wmean), imbalance = wmax/wmean
+      and wet_frac = wet points / computed points (inner domain of the ocean subdomains)
+    """
+
+    Nj0glo, Ni0glo = lloce.shape
+    isoce = mpp_is_ocean(lloce, jperio, jpni, jpnj)
+    _, _, iimppt, ijmppt, ijpi, ijpj = mpp_basesplit(Ni0glo + 2*nn_hls, Nj0glo + 2*nn_hls, nn_hls,
+                                                     jpni, jpnj, jperio)
+    # inner domain of each subdomain, 0-based in the (Nj0glo, Ni0glo) arrays
+    i0, i1 = iimppt - 1, iimppt - 1 + ijpi - 2*nn_hls
+    j0, j1 = ijmppt - 1, ijmppt - 1 + ijpj - 2*nn_hls
+
+    zwet = lloce.astype(int) if levels is None else np.where(lloce, levels, 0)
+    zcum = np.zeros((Nj0glo + 1, Ni0glo + 1), dtype=np.int64)       # integral image
+    zcum[1:, 1:] = zwet.cumsum(axis=0).cumsum(axis=1)
+    iwet = zcum[j1][:, i1] - zcum[j0][:, i1] - zcum[j1][:, i0] + zcum[j0][:, i0]   # (jpnj, jpni)
+    iwet = iwet[isoce]
+
+    nlev = 1 if levels is None else int(levels.max())
+    icomp = isoce.sum() * (ijpi.max() - 2*nn_hls) * (ijpj.max() - 2*nn_hls) * nlev
+
+    return dict(wmin=int(iwet.min()), wmax=int(iwet.max()), wmean=float(iwet.mean()),
+                imbalance=float(iwet.max() / iwet.mean()), wet_frac=float(iwet.sum() / icomp) * 100.)
+
+
+def best_per_node(res, ncpn, nextra=0):
     """
     For each number of nodes, pick the best partition of the list that fits in it
 
     The list is sorted by decreasing number of cores (i.e. increasing subdomain size),
-    so the best partition on k nodes is the first one with nb_cores <= k*ncpn.
+    so the best partition on k nodes is the first one with nb_cores + nextra <= k*ncpn.
     Node counts that would not improve on k-1 nodes are skipped.
 
     Args:
     - res: list of best partitions from bestpartition(..., ldlist=True)
     - ncpn: number of cores per node
+    - nextra: cores reserved on the same nodes for other components (XIOS, OIFS, runoff-mapper, ...)
 
     Returns:
     - list of dicts (nodes, idle, fill + the partition keys)
     """
 
     out = []
-    knodes = -(-res[0]['nb_cores'] // ncpn)
+    knodes = -(-(res[0]['nb_cores'] + nextra) // ncpn)
     for k in range(1, knodes + 1):
-        r = next((r for r in res if r['nb_cores'] <= k*ncpn), None)
-        if r is not None and r['nb_cores'] > (k-1)*ncpn:
-            out.append(dict(r, nodes=k, idle=k*ncpn - r['nb_cores'], fill=r['nb_cores'] / (k*ncpn) * 100.))
+        r = next((r for r in res if r['nb_cores'] + nextra <= k*ncpn), None)
+        if r is not None and r['nb_cores'] + nextra > (k-1)*ncpn:
+            nused = r['nb_cores'] + nextra
+            out.append(dict(r, nodes=k, idle=k*ncpn - nused, fill=nused / (k*ncpn) * 100.))
 
     return out
 
@@ -386,6 +457,19 @@ def plot_decomposition(filename, lloce, jperio, jpni, jpnj, cfg=None):
     plt.close(fig)
 
 
+def print_balance(res, lloce, jperio, nn_hls=1, levels=None):
+    """ Print the load-balance diagnostics (see load_balance) of a list of partitions """
+
+    cwet = '2D' if levels is None else '3D'
+    print(f'   load balance ({cwet} wet points in the inner domain of the ocean subdomains)')
+    print('   -----------------------------------------------------------')
+    for r in res:
+        b = load_balance(lloce, jperio, r['jpni'], r['jpnj'], nn_hls, levels)
+        print(f"   jpni x jpnj = {r['jpni']:4d} x {r['jpnj']:4d}, nb_cores oce: {r['nb_cores']:6d}, "
+              f"wet points min/mean/max: {b['wmin']:7d} / {b['wmean']:9.1f} / {b['wmax']:7d}, "
+              f"imbalance: {b['imbalance']:5.2f}, wet fraction: {b['wet_frac']:5.1f}%")
+
+
 def print_list(res):
     """ Print the list of best partitions with the same format as NEMO ocean.output """
 
@@ -414,6 +498,10 @@ def main():
     parser.add_argument('--jpnj', type=int, default=None, help='check this decomposition along j (with --jpni)')
     parser.add_argument('--cores-per-node', type=int, default=None,
                         help='also print the best partition for each number of nodes')
+    parser.add_argument('--extra-cores', type=int, default=0,
+                        help='cores reserved on the same nodes for other components (with --cores-per-node)')
+    parser.add_argument('--balance', action='store_true',
+                        help='print load-balance diagnostics (3D wet points if the levels are available)')
     parser.add_argument('--plot', default=None, metavar='FILE',
                         help='plot the decomposition (--jpni/--jpnj, otherwise the best one for ncores)')
     parser.add_argument('--save-mask', default=None, metavar='FILE.npz',
@@ -429,9 +517,10 @@ def main():
 
     lloce, jperio, cfg = read_bathymetry(args.domcfg, args.bdy)
     nn_hls = max(1, args.hls)
+    levels = read_levels(args.domcfg) if args.balance or args.save_mask else None
 
     if args.save_mask:
-        save_mask(args.save_mask, lloce, jperio, cfg)
+        save_mask(args.save_mask, lloce, jperio, cfg, levels)
         print(f'   land-sea mask saved in {args.save_mask}')
         return
 
@@ -461,6 +550,9 @@ def main():
             print('    ---   YOU ARE WASTING CPU...   ---')
         else:
             print('   ==> you use the best mpi decomposition')
+        if args.balance:
+            print(' ')
+            print_balance([r, b], lloce, jperio, nn_hls, levels)
         print(' ')
         print_namelist(r)
     elif args.best:
@@ -468,6 +560,9 @@ def main():
         r = decomposition_info(lloce, jperio, ni, nj, nn_hls)
         print(f"   The best domain decomposition {ni} x {nj} with {r['land']} land subdomains")
         print(f"      - uses a total of {r['nb_cores']} mpi process")
+        if args.balance:
+            print(' ')
+            print_balance([r], lloce, jperio, nn_hls, levels)
         print(' ')
         print_namelist(r)
     else:
@@ -477,11 +572,15 @@ def main():
             print(' ')
             for r in res:
                 print(f"nb_cores oce: {r['nb_cores']:6d}  ->  jpni = {r['jpni']:4d}, jpnj = {r['jpnj']:4d}")
+        if args.balance:
+            print(' ')
+            print_balance(res, lloce, jperio, nn_hls, levels)
         if args.cores_per_node:
             print(' ')
-            print(f"   best partition for each number of nodes ({args.cores_per_node} cores per node)")
+            print(f"   best partition for each number of nodes ({args.cores_per_node} cores per node"
+                  + (f", {args.extra_cores} reserved for other components)" if args.extra_cores else ")"))
             print('   -----------------------------------------------------------')
-            for r in best_per_node(res, args.cores_per_node):
+            for r in best_per_node(res, args.cores_per_node, args.extra_cores):
                 print(f"   nodes: {r['nodes']:4d}, nb_cores oce: {r['nb_cores']:6d}, idle cores: {r['idle']:4d} "
                       f"(fill {r['fill']:5.1f}%), jpni x jpnj = {r['jpni']:4d} x {r['jpnj']:4d}, "
                       f"largest oce domain: {r['iszi']:4d} x {r['iszj']:4d}")
