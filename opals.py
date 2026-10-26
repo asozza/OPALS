@@ -151,7 +151,7 @@ def mpp_init_landprop(lloce):
     return 1.0 - np.count_nonzero(lloce) / lloce.size
 
 
-def mpp_is_ocean(lloce, jperio, inbi, inbj):
+def mpp_is_ocean(lloce, jperio, inbi, inbj, lxios=True):
     """
     Check for a mpi domain decomposition inbi x inbj which subdomains,
     including 1 halo, contain at least 1 ocean point (mpp_is_ocean)
@@ -160,9 +160,10 @@ def mpp_is_ocean(lloce, jperio, inbi, inbj):
     - lloce: boolean land-sea mask (Nj0glo, Ni0glo)
     - jperio: lateral boundary condition type
     - inbi, inbj: number of subdomains along i and j
+    - lxios: NEMO compiled with key_xios, which keeps the first subdomain of each row of land-only subdomains
 
     Returns:
-    - ldisoce: boolean array (inbj, inbi), True if the subdomain contains ocean
+    - ldisoce: boolean array (inbj, inbi), True if the subdomain contains ocean (or is kept for XIOS)
     """
 
     Nj0glo, Ni0glo = lloce.shape
@@ -215,10 +216,16 @@ def mpp_is_ocean(lloce, jperio, inbi, inbj):
         i1 = iimppt + ijpi + 1
         inboce[iarea-1, :] = icol[i1] - icol[i0-1]
 
-    return inboce != 0
+    ldisoce = inboce != 0
+    if lxios:
+        # XIOS decomposes the domain in bands and crashes if a band contains only suppressed
+        # land subdomains: NEMO keeps the first subdomain of each row of land subdomains
+        ldisoce[~ldisoce.any(axis=1), 0] = True
+
+    return ldisoce
 
 
-def bestpartition(lloce, jperio, knbij, nn_hls=1, ldlist=False):
+def bestpartition(lloce, jperio, knbij, nn_hls=1, ldlist=False, lxios=True):
     """
     Find the best domain decomposition for NEMO (bestpartition)
 
@@ -228,6 +235,7 @@ def bestpartition(lloce, jperio, knbij, nn_hls=1, ldlist=False):
     - knbij: number of MPI processes
     - nn_hls: halo width
     - ldlist: if True, return the list of the best partitions (ln_listonly)
+    - lxios: NEMO compiled with key_xios (see mpp_is_ocean)
 
     Returns:
     - if ldlist: list of dicts (nb_cores, land, percentage, size, iszi, iszj, jpni, jpnj)
@@ -249,16 +257,23 @@ def bestpartition(lloce, jperio, knbij, nn_hls=1, ldlist=False):
 
     # get the list of knbi that gives a smaller jpimax than knbi-1
     # get the list of knbj that gives a smaller jpjmax than knbj-1
+    # (minimum subdomain size so that halos always address the neighbour inner domain,
+    #  and V and F folding are outside of the southern halos)
+    iszimin = iszjmin = 3*nn_hls
+    if jperio in (3, 4):
+        iszjmin = max(iszjmin, 2 + 3*nn_hls)
+    elif jperio in (5, 6):
+        iszjmin = max(iszjmin, 1 + 3*nn_hls)
     inbi0, iszi0, inbj0, iszj0 = [], [], [], []
     isziref = iszjref = jpiglo*jpjglo + 1
     for ji in range(1, inbijmax + 1):
         iszitst = ( Ni0glo + (ji-1) ) // ji + 2*nn_hls
-        if iszitst < isziref:
+        if iszitst < isziref and iszitst >= iszimin:
             isziref = iszitst
             inbi0.append(ji)
             iszi0.append(isziref)
         iszjtst = ( Nj0glo + (ji-1) ) // ji + 2*nn_hls
-        if iszjtst < iszjref:
+        if iszjtst < iszjref and iszjtst >= iszjmin:
             iszjref = iszjtst
             inbj0.append(ji)
             iszj0.append(iszjref)
@@ -271,9 +286,9 @@ def bestpartition(lloce, jperio, knbij, nn_hls=1, ldlist=False):
 
     # extract only the partitions which reduce the subdomain size in comparison with smaller partitions
     best = {}
-    for c in cand:                                           # first occurrence of the min size for each ni*nj
-        nij, szij = c[0]*c[1], c[2]*c[3]
-        if nij not in best or szij < best[nij][2]*best[nij][3]:
+    for c in cand:                                           # min size for each ni*nj, then the smaller
+        nij, key = c[0]*c[1], (c[2]*c[3], c[2] + c[3])       # perimeter, then the first occurrence
+        if nij not in best or key < (best[nij][2]*best[nij][3], best[nij][2] + best[nij][3]):
             best[nij] = c
     parts = []
     iszij = jpiglo*jpjglo + 1
@@ -286,9 +301,9 @@ def bestpartition(lloce, jperio, knbij, nn_hls=1, ldlist=False):
     if ldlist:
         res = []
         ni, nj = parts[-1][:2]
-        inbijold = np.count_nonzero(mpp_is_ocean(lloce, jperio, ni, nj))
+        inbijold = np.count_nonzero(mpp_is_ocean(lloce, jperio, ni, nj, lxios))
         for ni, nj, si, sj in parts[-2::-1]:
-            inbij = np.count_nonzero(mpp_is_ocean(lloce, jperio, ni, nj))
+            inbij = np.count_nonzero(mpp_is_ocean(lloce, jperio, ni, nj, lxios))
             if inbij < inbijold:
                 res.append(dict(nb_cores=inbij, land=ni*nj - inbij,
                                 percentage=(ni*nj - inbij) / (ni*nj) * 100.,
@@ -298,14 +313,14 @@ def bestpartition(lloce, jperio, knbij, nn_hls=1, ldlist=False):
 
     # start from the end of the list (smaller subdomains) while the number of ocean subdomains exceeds the number of procs
     for ni, nj, _, _ in parts[::-1]:
-        inbij = np.count_nonzero(mpp_is_ocean(lloce, jperio, ni, nj))
+        inbij = np.count_nonzero(mpp_is_ocean(lloce, jperio, ni, nj, lxios))
         if inbij <= knbij:
             return ni, nj, ni*nj - inbij
 
     return None
 
 
-def decomposition_info(lloce, jperio, jpni, jpnj, nn_hls=1):
+def decomposition_info(lloce, jperio, jpni, jpnj, nn_hls=1, lxios=True):
     """
     Describe a given jpni x jpnj decomposition
 
@@ -314,7 +329,7 @@ def decomposition_info(lloce, jperio, jpni, jpnj, nn_hls=1):
     """
 
     Nj0glo, Ni0glo = lloce.shape
-    isoce = mpp_is_ocean(lloce, jperio, jpni, jpnj)
+    isoce = mpp_is_ocean(lloce, jperio, jpni, jpnj, lxios)
     jpimax, jpjmax, *_ = mpp_basesplit(Ni0glo + 2*nn_hls, Nj0glo + 2*nn_hls, nn_hls, jpni, jpnj, jperio)
     inbij = int(np.count_nonzero(isoce))
 
@@ -323,7 +338,7 @@ def decomposition_info(lloce, jperio, jpni, jpnj, nn_hls=1):
                 jpimax=jpimax, jpjmax=jpjmax, isoce=isoce)
 
 
-def load_balance(lloce, jperio, jpni, jpnj, nn_hls=1, levels=None):
+def load_balance(lloce, jperio, jpni, jpnj, nn_hls=1, levels=None, lxios=True):
     """
     Load-balance diagnostics of a jpni x jpnj decomposition, based on the wet points
     in the inner domain (no halos) of each ocean subdomain
@@ -346,7 +361,7 @@ def load_balance(lloce, jperio, jpni, jpnj, nn_hls=1, levels=None):
     """
 
     Nj0glo, Ni0glo = lloce.shape
-    isoce = mpp_is_ocean(lloce, jperio, jpni, jpnj)
+    isoce = mpp_is_ocean(lloce, jperio, jpni, jpnj, lxios)
     _, _, iimppt, ijmppt, ijpi, ijpj = mpp_basesplit(Ni0glo + 2*nn_hls, Nj0glo + 2*nn_hls, nn_hls,
                                                      jpni, jpnj, jperio)
     # inner domain of each subdomain, 0-based in the (Nj0glo, Ni0glo) arrays
@@ -406,7 +421,7 @@ def print_namelist(r):
     print(f"   ==> run nemo.exe on {r['nb_cores']} MPI tasks ({r['land']} land subdomains suppressed)")
 
 
-def plot_decomposition(filename, lloce, jperio, jpni, jpnj, cfg=None):
+def plot_decomposition(filename, lloce, jperio, jpni, jpnj, cfg=None, lxios=True):
     """
     Plot the land-sea mask with the jpni x jpnj subdomains on top:
     suppressed land subdomains are shaded, ocean subdomains are labelled with their MPI rank
@@ -422,7 +437,7 @@ def plot_decomposition(filename, lloce, jperio, jpni, jpnj, cfg=None):
 
     Nj0glo, Ni0glo = lloce.shape
     _, _, iimppt, ijmppt, ijpi, ijpj = mpp_basesplit(Ni0glo, Nj0glo, 0, jpni, jpnj, jperio)
-    isoce = mpp_is_ocean(lloce, jperio, jpni, jpnj)
+    isoce = mpp_is_ocean(lloce, jperio, jpni, jpnj, lxios)
 
     fig, ax = plt.subplots(figsize=(12, 12 * Nj0glo / Ni0glo + 0.8))
     ax.imshow(lloce, origin='lower', cmap=ListedColormap(['#e6dcc3', '#9ecae1']), vmin=0, vmax=1,
@@ -457,14 +472,14 @@ def plot_decomposition(filename, lloce, jperio, jpni, jpnj, cfg=None):
     plt.close(fig)
 
 
-def print_balance(res, lloce, jperio, nn_hls=1, levels=None):
+def print_balance(res, lloce, jperio, nn_hls=1, levels=None, lxios=True):
     """ Print the load-balance diagnostics (see load_balance) of a list of partitions """
 
     cwet = '2D' if levels is None else '3D'
     print(f'   load balance ({cwet} wet points in the inner domain of the ocean subdomains)')
     print('   -----------------------------------------------------------')
     for r in res:
-        b = load_balance(lloce, jperio, r['jpni'], r['jpnj'], nn_hls, levels)
+        b = load_balance(lloce, jperio, r['jpni'], r['jpnj'], nn_hls, levels, lxios)
         print(f"   jpni x jpnj = {r['jpni']:4d} x {r['jpnj']:4d}, nb_cores oce: {r['nb_cores']:6d}, "
               f"wet points min/mean/max: {b['wmin']:7d} / {b['wmean']:9.1f} / {b['wmax']:7d}, "
               f"imbalance: {b['imbalance']:5.2f}, wet fraction: {b['wet_frac']:5.1f}%")
@@ -506,6 +521,8 @@ def main():
                         help='plot the decomposition (--jpni/--jpnj, otherwise the best one for ncores)')
     parser.add_argument('--save-mask', default=None, metavar='FILE.npz',
                         help='save the land-sea mask in a small .npz file and exit')
+    parser.add_argument('--no-xios', action='store_true',
+                        help='NEMO compiled without key_xios: do not keep one subdomain in the rows of land subdomains')
     parser.add_argument('-v', '--verbose', action='store_true', help='also print jpni x jpnj in the list')
     args = parser.parse_args()
 
@@ -517,6 +534,7 @@ def main():
 
     lloce, jperio, cfg = read_bathymetry(args.domcfg, args.bdy)
     nn_hls = max(1, args.hls)
+    lxios = not args.no_xios
     levels = read_levels(args.domcfg) if args.balance or args.save_mask else None
 
     if args.save_mask:
@@ -534,13 +552,13 @@ def main():
 
     if lcheck:
         # same diagnostics as mpp_init when jpni and jpnj are given in the namelist
-        r = decomposition_info(lloce, jperio, args.jpni, args.jpnj, nn_hls)
+        r = decomposition_info(lloce, jperio, args.jpni, args.jpnj, nn_hls, lxios)
         print(f"   The chosen domain decomposition {r['jpni']} x {r['jpnj']} with {r['land']} land subdomains")
         print(f"      - uses a total of {r['nb_cores']} mpi process")
         print(f"      - has mpi subdomains with a maximum size of (jpi = {r['jpimax']}, jpj = {r['jpjmax']}, "
               f"jpi*jpj = {r['jpimax']*r['jpjmax']})")
-        ni, nj, _ = bestpartition(lloce, jperio, args.ncores or r['nb_cores'], nn_hls)
-        b = decomposition_info(lloce, jperio, ni, nj, nn_hls)
+        ni, nj, _ = bestpartition(lloce, jperio, args.ncores or r['nb_cores'], nn_hls, lxios=lxios)
+        b = decomposition_info(lloce, jperio, ni, nj, nn_hls, lxios)
         print(f"   The best domain decomposition {b['jpni']} x {b['jpnj']} with {b['land']} land subdomains")
         print(f"      - uses a total of {b['nb_cores']} mpi process")
         print(f"      - has mpi subdomains with a maximum size of (jpi = {b['jpimax']}, jpj = {b['jpjmax']}, "
@@ -552,21 +570,21 @@ def main():
             print('   ==> you use the best mpi decomposition')
         if args.balance:
             print(' ')
-            print_balance([r, b], lloce, jperio, nn_hls, levels)
+            print_balance([r, b], lloce, jperio, nn_hls, levels, lxios)
         print(' ')
         print_namelist(r)
     elif args.best:
-        ni, nj, _ = bestpartition(lloce, jperio, args.ncores, nn_hls)
-        r = decomposition_info(lloce, jperio, ni, nj, nn_hls)
+        ni, nj, _ = bestpartition(lloce, jperio, args.ncores, nn_hls, lxios=lxios)
+        r = decomposition_info(lloce, jperio, ni, nj, nn_hls, lxios)
         print(f"   The best domain decomposition {ni} x {nj} with {r['land']} land subdomains")
         print(f"      - uses a total of {r['nb_cores']} mpi process")
         if args.balance:
             print(' ')
-            print_balance([r], lloce, jperio, nn_hls, levels)
+            print_balance([r], lloce, jperio, nn_hls, levels, lxios)
         print(' ')
         print_namelist(r)
     else:
-        res = bestpartition(lloce, jperio, args.ncores, nn_hls, ldlist=True)
+        res = bestpartition(lloce, jperio, args.ncores, nn_hls, ldlist=True, lxios=lxios)
         print_list(res)
         if args.verbose:
             print(' ')
@@ -574,7 +592,7 @@ def main():
                 print(f"nb_cores oce: {r['nb_cores']:6d}  ->  jpni = {r['jpni']:4d}, jpnj = {r['jpnj']:4d}")
         if args.balance:
             print(' ')
-            print_balance(res, lloce, jperio, nn_hls, levels)
+            print_balance(res, lloce, jperio, nn_hls, levels, lxios)
         if args.cores_per_node:
             print(' ')
             print(f"   best partition for each number of nodes ({args.cores_per_node} cores per node"
@@ -586,12 +604,12 @@ def main():
                       f"largest oce domain: {r['iszi']:4d} x {r['iszj']:4d}")
         ni = nj = None
         if args.plot:
-            ni, nj, _ = bestpartition(lloce, jperio, args.ncores, nn_hls)
+            ni, nj, _ = bestpartition(lloce, jperio, args.ncores, nn_hls, lxios=lxios)
 
     if args.plot:
         if lcheck:
             ni, nj = args.jpni, args.jpnj
-        plot_decomposition(args.plot, lloce, jperio, ni, nj, cfg)
+        plot_decomposition(args.plot, lloce, jperio, ni, nj, cfg, lxios)
         print(' ')
         print(f'   decomposition {ni} x {nj} plotted in {args.plot}')
 

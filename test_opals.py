@@ -10,7 +10,7 @@ Run with:
 
 The land-sea masks are stored as small .npz files in data/ (see opals.py --save-mask),
 since domain_cfg.nc files are too large for the repository.
-data/orca2_ref.txt is the list printed by nemo.exe with ln_listonly = .true. (ORCA2, 256 cores).
+data/<grid>_ref.txt are the lists printed by nemo.exe with ln_listonly = .true.
 """
 
 import io
@@ -44,6 +44,32 @@ class TestBasesplit(unittest.TestCase):
                     self.assertTrue((np.diff(ijmppt) == ijpj[:-1] - 2*khls).all())
 
 
+class TestNemoLists(unittest.TestCase):
+    """ lists printed by nemo.exe 4.2 (ln_listonly = .true., compiled with key_xios) """
+
+    CASES = [('orca2', 256), ('paleorca2', 256), ('orca1', 256), ('eorca1', 947), ('eorca1_iso', 256)]
+
+    def test_lists_match_nemo(self):
+        for name, ncores in self.CASES:
+            with self.subTest(grid=name):
+                lloce, jperio, _ = load(f'{name}_mask.npz')
+                res = opals.bestpartition(lloce, jperio, ncores, ldlist=True)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    opals.print_list(res)
+                got = [l.rstrip() for l in buf.getvalue().splitlines() if l.startswith('nb_cores')]
+                with open(os.path.join(DATA, f'{name}_ref.txt')) as f:
+                    ref = [l.rstrip() for l in f]
+                self.assertEqual(got, ref)
+
+    def test_xios_keeps_one_subdomain_per_land_row(self):
+        lloce, jperio, _ = load('paleorca2_mask.npz')                 # southern rows are land
+        isoce = opals.mpp_is_ocean(lloce, jperio, 1, 11, lxios=False)
+        self.assertFalse(isoce[0, 0])
+        self.assertTrue(opals.mpp_is_ocean(lloce, jperio, 1, 11)[0, 0])
+        self.assertEqual(np.count_nonzero(isoce), 10)
+
+
 class TestORCA2(unittest.TestCase):
 
     @classmethod
@@ -53,16 +79,6 @@ class TestORCA2(unittest.TestCase):
     def test_mask(self):
         self.assertEqual(self.lloce.shape, (148, 180))
         self.assertEqual(self.jperio, 4)
-
-    def test_list_matches_nemo(self):
-        res = opals.bestpartition(self.lloce, self.jperio, 256, ldlist=True)
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            opals.print_list(res)
-        got = [l.rstrip() for l in buf.getvalue().splitlines() if l.startswith('nb_cores')]
-        with open(os.path.join(DATA, 'orca2_ref.txt')) as f:
-            ref = [l.rstrip() for l in f]
-        self.assertEqual(got, ref)
 
     def test_best_is_consistent_with_list(self):
         res = opals.bestpartition(self.lloce, self.jperio, 256, ldlist=True)
@@ -130,8 +146,8 @@ class TestEORCA1(unittest.TestCase):
 
     def test_best(self):
         self.assertEqual(self.jperio, 6)
-        self.assertEqual(opals.bestpartition(self.lloce, self.jperio, 256), (24, 14, 80))
-        self.assertEqual(opals.bestpartition(self.lloce, self.jperio, 1024), (40, 37, 462))
+        self.assertEqual(opals.bestpartition(self.lloce, self.jperio, 256), (20, 16, 71))
+        self.assertEqual(opals.bestpartition(self.lloce, self.jperio, 1024), (40, 37, 458))
 
     def test_list_is_monotonic(self):
         res = opals.bestpartition(self.lloce, self.jperio, 1024, ldlist=True)

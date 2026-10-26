@@ -44,6 +44,10 @@ that fits in it, and reports the idle cores left on the nodes (e.g. for XIOS or 
   with the wet points (sea ice, I/O, some diagnostics). A minimum of 0 means that NEMO keeps
   subdomains with ocean only in their halo.
 
+As NEMO compiled with `key_xios`, OPALS keeps the first subdomain of each row of land-only subdomains
+(XIOS decomposes the domain in bands and crashes on a band without subdomains): this happens on grids whose
+southern rows are all land (eORCA1, PALEORCA2). Use `--no-xios` for a NEMO executable compiled without XIOS.
+
 A `.npz` mask written by `--save-mask` (land-sea mask + number of wet levels) can be used everywhere in place of `domain_cfg.nc`.
 `domain_cfg.nc` files are too large for the repository (see `.gitignore`).
 
@@ -53,5 +57,7 @@ A `.npz` mask written by `--save-mask` (land-sea mask + number of wet levels) ca
 python -m unittest -v test_opals
 ```
 
-`data/orca2_mask.npz` and `data/eorca1_mask.npz` are the land-sea masks of ORCA2 and eORCA1,
-`data/orca2_ref.txt` is the list printed by `nemo.exe` for ORCA2 with 256 cores, reproduced exactly.
+`data/<grid>_mask.npz` are the land-sea masks of ORCA2, PALEORCA2 (Eocene), ORCA1, eORCA1 and eORCA1_ISO,
+`data/<grid>_ref.txt` the lists printed by `nemo.exe` 4.2 for the same `domain_cfg.nc` (256 cores, 947 for eORCA1),
+all reproduced exactly. `data/<grid>_list.txt` are the lists computed by OPALS
+(`-n 256` for ORCA2 and PALEORCA2, `-n 1024` for the 1° grids, with `-v`).
